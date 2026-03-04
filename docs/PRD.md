@@ -1,5 +1,5 @@
 # Product Requirements Document (PRD)
-## Circuit Knowledge Graph Assistant (CKGA) – MVP/POC v1.1
+## Circuit Knowledge Graph Assistant (CKGA) – MVP/POC v1.1 (Consolidated)
 
 ## 1) Objective
 Build a fully working MVP/POC that can ingest automotive circuit diagram PDFs, extract graph entities and relationships, and support chatbot-style question answering grounded in the extracted graph.
@@ -24,6 +24,7 @@ Core target capability:
 - Query graph via API and chat UI.
 - Track metrics and structured logs.
 - Add strict validation and guardrails to reduce hallucinations.
+- Apply confidence-aware querying and response formatting.
 
 ### Out of Scope (Phase 1)
 - Multi-user auth/roles.
@@ -86,21 +87,28 @@ Frontend (React Chat + Upload)
   "page": 1,
   "components": [
     {
-      "component_key": "RELAY_R1",
+      "component_key": "RELAY_R1__P1",
       "label_raw": "Relay R1",
-      "label_normalized": "RELAY R1",
+      "label_normalized": "RELAY_R1",
       "type": "Relay",
-      "bbox": [120, 340, 180, 380],
+      "page": "1",
+      "bbox": {
+        "x_min": 120,
+        "y_min": 340,
+        "x_max": 180,
+        "y_max": 380
+      },
       "confidence": 0.92
     }
   ],
   "connections": [
     {
-      "from_component_key": "BATTERY_MAIN",
-      "to_component_key": "FUSE_F1",
+      "from_component_key": "BATTERY_MAIN__P1",
+      "to_component_key": "FUSE_F1__P1",
       "wire_color_raw": "Red",
       "wire_color_normalized": "RED",
       "direction": "outgoing",
+      "page": "1",
       "cross_page_ref": null,
       "confidence": 0.89
     }
@@ -108,9 +116,15 @@ Frontend (React Chat + Upload)
 }
 ```
 
-#### Normalization rules
-- `component_key`: deterministic uppercase key, e.g. `TYPE_LABELTOKEN` format.
-- `label_normalized`: uppercase, trimmed, condensed spacing.
+#### Normalization and key rules
+- `component_key` must be deterministic from `label_raw` and page hint:
+  1. Uppercase.
+  2. Replace non-alphanumeric with single `_`.
+  3. Collapse repeated `_` and trim leading/trailing `_`.
+  4. Normalize page token using same rule, prefix numeric-only page with `P`, use `UNKNOWN_PAGE` if unresolved.
+  5. Compose as `<LABEL_NORMALIZED>__<PAGE_HINT>`.
+  6. If collision remains in the same payload, append stable suffix `__N` (1-based).
+- `label_normalized`: uppercase tokenized canonical label.
 - `wire_color_normalized`: uppercase enum-like string (`RED`, `BLK`, `YEL`, etc.).
 - `direction` enum: `incoming | outgoing | bidirectional | unknown`.
 
@@ -137,12 +151,14 @@ Use `NetworkX DiGraph`.
 - `label_raw`
 - `label_normalized`
 - `type`
-- `pages` (set/list)
+- `page`
+- `bbox`
 - `confidence`
 
 #### Edge attributes
-- `source`
-- `target`
+- `from_component_key`
+- `to_component_key`
+- `wire_color_raw`
 - `wire_color_normalized`
 - `direction`
 - `page`
@@ -152,7 +168,7 @@ Use `NetworkX DiGraph`.
 #### Special processing
 - Identify battery nodes (`type == PowerSource` OR label contains battery token).
 - Compute flow depth from battery node(s) via DFS/BFS.
-- Track unresolved cross-page edges for second pass resolution.
+- Track unresolved cross-page edges for second-pass resolution.
 
 ---
 
@@ -165,13 +181,22 @@ Use `NetworkX DiGraph`.
 ```
 
 #### Query planning contract
-LLM must convert user question to DSL JSON:
+LLM must convert user question to DSL JSON only:
 ```json
 {
   "intent": "COUNT_AND_LIST_INCOMING",
   "component": "Relay R1"
 }
 ```
+
+Required fields:
+- `intent` (string): one supported backend intent.
+- `component` (string): raw component reference extracted from user input.
+
+Optional fields:
+- `time_range` (object)
+- `filters` (object)
+- `metadata` (object)
 
 #### Supported intents
 - `GET_INCOMING`
@@ -183,38 +208,81 @@ LLM must convert user question to DSL JSON:
 - `TRACE_FROM_BATTERY`
 - `FIND_PATH`
 
-#### Execution behavior
-1. Resolve component text to `component_key` (exact → normalized → fuzzy).
-2. If ambiguous, return clarification payload with top candidates.
-3. Execute deterministic graph query.
-4. Return structured answer + evidence + confidence warning if needed.
+#### Component-resolution behavior
+1. Resolve component text to canonical key (exact → normalized → fuzzy).
+2. Score candidates with deterministic confidence scoring.
+3. If multiple plausible matches exceed ambiguity threshold, return ambiguity response.
+4. If no candidate passes minimum threshold, skip data retrieval and return `UNKNOWN_COMPONENT`.
 
-**Response example**:
+Determinism requirements:
+- Same input + same registry snapshot => same output.
+- Candidate sorting: descending confidence, then lexical name.
+- Include top-3 nearest candidates when available.
+
+#### Ambiguity response format
 ```json
 {
-  "answer": "Relay R1 has 2 incoming wires: RED from Fuse F1 and BLK from Connector C2.",
-  "intent": "COUNT_AND_LIST_INCOMING",
-  "component_key": "RELAY_R1",
-  "incoming_count": 2,
-  "incoming_wires": [
-    {"from": "FUSE_F1", "wire_color": "RED", "page": 2},
-    {"from": "CONNECTOR_C2", "wire_color": "BLK", "page": 3}
-  ],
-  "evidence": {
-    "nodes_used": ["RELAY_R1", "FUSE_F1", "CONNECTOR_C2"],
-    "edges_used": ["FUSE_F1->RELAY_R1", "CONNECTOR_C2->RELAY_R1"],
-    "pages_used": [2, 3]
+  "status": "AMBIGUOUS_COMPONENT",
+  "query": {
+    "intent": "GET_INCOMING",
+    "component": "Relay"
   },
-  "confidence_summary": {
-    "min_edge_confidence": 0.71,
-    "warning": "Some extracted links are low confidence; verify on source diagram."
-  }
+  "candidates": [
+    { "name": "Relay R1", "confidence": 0.91 },
+    { "name": "Relay R2", "confidence": 0.87 },
+    { "name": "Relay Main", "confidence": 0.79 }
+  ],
+  "message": "I found multiple matching components. Please confirm one of the candidates.",
+  "requires_confirmation": true
 }
 ```
 
+#### LLM output and validation requirements
+1. Parse raw LLM output as JSON.
+2. Validate query JSON with Pydantic models before backend execution.
+3. Reject invalid payloads with structured validation error response.
+4. Execute backend logic only on validated payloads.
+
+Validation failure response should include:
+- `status: "INVALID_QUERY_PAYLOAD"`
+- `errors`: schema violations
+- `message`: user-safe retry prompt
+
+#### Query execution response requirements
+- Graph-grounded answer only.
+- Include evidence (`nodes_used`, `edges_used`, `pages_used`).
+- Include confidence payload only when `include_confidence=true`.
+
 ---
 
-### FR5 – Metrics Endpoint
+### FR5 – Confidence-Aware Querying
+#### Parser-stage confidence
+- Parser must output `confidence` for every node and edge.
+- Confidence values are normalized floats in `[0.0, 1.0]`.
+- Missing confidence values treated as `null` and counted in quality metrics.
+
+#### Optional query parameter
+- `include_confidence` (default `false`).
+- If `true`, response must include:
+  - `confidence_summary`
+  - `uncertainty_note`
+  - threshold-based warnings
+
+#### Confidence summary fields
+- `node_confidence_avg`
+- `edge_confidence_avg`
+- `overall_confidence`
+- `low_confidence_node_ratio`
+- `low_confidence_edge_ratio`
+
+#### Threshold-based warnings
+- Configurable threshold; default `0.65`.
+- If `overall_confidence < 0.65`, `uncertainty_note` must include: **"verify manually"**.
+- If node/edge averages are below threshold, include per-dimension warnings.
+
+---
+
+### FR6 – Metrics Endpoint
 **Endpoint**: `GET /metrics`
 
 **Returns**:
@@ -226,13 +294,81 @@ LLM must convert user question to DSL JSON:
   "parse_time_ms_avg": 1840,
   "query_latency_ms_p95": 320,
   "unresolved_cross_page_refs": 3,
+  "low_confidence_node_ratio": 0.11,
   "low_confidence_edge_ratio": 0.14
 }
 ```
 
+System metrics must be emitted per query and aggregated over time for dashboards/alerts.
+
 ---
 
-## 5) Non-Functional Requirements
+## 5) Data Schema and Validation
+
+### Component schema (required)
+- `component_key` (string)
+- `label_raw` (string)
+- `label_normalized` (string)
+- `type` (enum)
+- `page` (string)
+- `bbox` (object with `x_min`, `y_min`, `x_max`, `y_max`)
+- `confidence` (number in `[0.0, 1.0]`)
+
+Validation constraints:
+- `x_min < x_max`
+- `y_min < y_max`
+
+### Connection schema (required)
+- `from_component_key` (string)
+- `to_component_key` (string)
+- `wire_color_raw` (string)
+- `wire_color_normalized` (string)
+- `direction` (enum)
+- `page` (string)
+- `cross_page_ref` (string|null)
+- `confidence` (number in `[0.0, 1.0]`)
+
+Validation constraints:
+- `from_component_key != to_component_key` unless explicitly marked loop/test.
+- Connection endpoints must resolve to known components.
+
+### Direction enumeration
+- `incoming`
+- `outgoing`
+- `bidirectional`
+- `unknown`
+
+### Type enumeration
+- `PowerSource`, `Ground`, `Fuse`, `FusibleLink`, `Relay`, `Switch`, `Connector`, `Splice`, `Junction`, `ControlUnit`, `Sensor`, `Actuator`, `Lamp`, `Motor`, `Resistor`, `Diode`, `Capacitor`, `Transistor`, `Terminal`, `Bus`, `TestPoint`, `Unknown`
+
+### Payload validation and repair rule
+All payloads must be validated before graph insertion.
+- Deterministic repair is allowed for recoverable issues (enum casing, key regeneration, clamping confidence, null-like coercion).
+- If required fields are missing or repair requires guesswork, reject payload (or invalid records in partial-ingest mode) and log explicit errors.
+- No invalid component or connection may be inserted.
+
+---
+
+## 6) Guardrails and DON’Ts
+
+### Must-do guardrails
+1. Graph-grounded answers only.
+2. Evidence required: cite component keys/pages/edges used.
+3. Ambiguity flow: never silently pick among multiple plausible components.
+4. Confidence warning on low-confidence outputs.
+5. Error taxonomy with explicit statuses: `NOT_FOUND`, `UNKNOWN_COMPONENT`, `AMBIGUOUS_COMPONENT`, `INSUFFICIENT_GRAPH_DATA`, `INVALID_QUERY_PLAN`, `INVALID_QUERY_PAYLOAD`.
+
+### DON’Ts
+1. Do not invent components/wires absent in graph.
+2. Do not answer from model priors when graph lookup fails.
+3. Do not omit citations for derivation evidence.
+4. Return `NOT_FOUND`/`INSUFFICIENT_GRAPH_DATA` when graph evidence is missing.
+5. Block unsupported safety-critical asks with safe refusal template.
+6. Don’t expose API keys, raw secrets, or sensitive logs.
+
+---
+
+## 7) Non-Functional Requirements
 - Query latency target: `< 3s`.
 - Parsing latency target: `< 5s/page`.
 - Strict JSON validation for parser and query planner output.
@@ -241,25 +377,7 @@ LLM must convert user question to DSL JSON:
 
 ---
 
-## 6) Guardrails and DON’Ts
-
-### Must-do guardrails
-1. **Graph-grounded answers only**: all answers must be derived from graph queries.
-2. **Evidence required**: include node/edge/page evidence in response payload.
-3. **Ambiguity flow**: if multiple component matches, request clarification.
-4. **Confidence warning**: show warning when confidence threshold falls below configured minimum.
-5. **Error taxonomy**: return explicit codes: `NOT_FOUND`, `AMBIGUOUS_COMPONENT`, `INSUFFICIENT_GRAPH_DATA`, `INVALID_QUERY_PLAN`.
-
-### DON’Ts
-- Don’t invent components, wires, directions, pages, or paths absent in graph.
-- Don’t answer from prior automotive knowledge when graph lacks data.
-- Don’t silently choose one of multiple component matches.
-- Don’t provide safety-critical diagnostic claims (e.g., “this car is safe to drive”) from incomplete graph context.
-- Don’t expose API keys, raw secrets, or sensitive logs.
-
----
-
-## 7) Tech Stack
+## 8) Tech Stack
 ### Backend
 - FastAPI
 - Uvicorn
@@ -281,7 +399,7 @@ LLM must convert user question to DSL JSON:
 
 ---
 
-## 8) Suggested Repository Structure
+## 9) Suggested Repository Structure
 ```text
 circuit-kg-assistant/
 ├── backend/
@@ -316,14 +434,14 @@ circuit-kg-assistant/
 │   │   └── api.js
 │   └── package.json
 ├── docs/
-│   └── PRD_Circuit_Knowledge_Graph_Assistant_MVP_v1.1.md
+│   └── PRD.md
 ├── README.md
 └── docker-compose.yml
 ```
 
 ---
 
-## 9) Implementation Notes
+## 10) Implementation Notes
 ### Parser flow
 1. PDF page → image.
 2. Image → LLM with strict schema instruction.
@@ -346,7 +464,7 @@ circuit-kg-assistant/
 
 ---
 
-## 10) Metrics to Track
+## 11) Metrics to Track
 - Components detected per page
 - Wires detected per page
 - Unresolved cross-page refs
@@ -358,7 +476,7 @@ circuit-kg-assistant/
 
 ---
 
-## 11) MVP Evaluation Cases
+## 12) MVP Evaluation Cases
 - “List outgoing wires from Battery.”
 - “Which wires go into Relay R1?”
 - “How many incoming wires are there for component A?”
@@ -368,7 +486,7 @@ circuit-kg-assistant/
 
 ---
 
-## 12) POC Success Criteria
+## 13) POC Success Criteria
 - ≥ 75% component extraction accuracy on validation set.
 - Incoming/outgoing wire query correctness on golden fixtures.
 - Flow trace from battery works on representative diagrams.
@@ -377,7 +495,7 @@ circuit-kg-assistant/
 
 ---
 
-## 13) Risk Areas and Mitigations
+## 14) Risk Areas and Mitigations
 1. **LLM invalid JSON** → schema validation + retry + fallback error.
 2. **Over/under-detected wires** → confidence scoring + manual review mode.
 3. **Cross-page complexity** → second-pass resolver + unresolved ref reporting.
@@ -385,7 +503,7 @@ circuit-kg-assistant/
 
 ---
 
-## 14) Future Upgrades (Phase 2+)
+## 15) Future Upgrades (Phase 2+)
 - Replace NetworkX with Neo4j.
 - Cypher generation and graph analytics.
 - Visual graph explorer UI.
@@ -394,9 +512,9 @@ circuit-kg-assistant/
 
 ---
 
-## 15) How to Use This PRD in Antigravity
+## 16) How to Use This PRD in Antigravity
 1. Create a project in Antigravity and upload this PRD.
-2. Ask Antigravity to generate epics from sections 4–6 and 10–12.
+2. Ask Antigravity to generate epics from sections 4–7 and 11–13.
 3. Generate implementation tasks in this order:
    - Backend skeleton + schemas
    - `/upload` parser flow
@@ -404,6 +522,5 @@ circuit-kg-assistant/
    - `/query` execution + guardrails
    - Metrics/logging
    - Frontend chat/upload
-4. Use section 12 as Definition of Done gates.
+4. Use section 13 as Definition of Done gates.
 5. Run weekly PRD drift review (implementation vs PRD contracts).
-
