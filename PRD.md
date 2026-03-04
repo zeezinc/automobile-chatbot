@@ -42,3 +42,33 @@ To improve wiring-reference linking across multi-page schematics, add a dedicate
 5. **Expose unresolved count in API outputs**
    - `/upload` response should include `unresolved_reference_count` (and optionally unresolved IDs for debugging).
    - `/metrics` should publish unresolved reference totals/gauges so operators can track reconciliation quality over time.
+
+## PRD consistency and completeness checks
+
+This `PRD.md` is the MVP acceptance addendum. The canonical end-to-end product specification remains in `docs/PRD.md`, and all contract names in this file must stay aligned with it.
+
+### Consistency fixes and conventions
+
+- Standardize unresolved-reference naming to `unresolved_reference_count` across all APIs, tests, dashboards, and docs.
+- Standardize error payloads to include at minimum: `error_code`, `message`, and `recoverable`.
+- Make HTTP status requirements explicit in test assertions:
+  - invalid input / schema errors: `4xx`
+  - server/runtime failures: `5xx`
+- Define benchmark environment metadata as mandatory for perf tests: CPU class, RAM, model/provider, and cold/warm cache mode.
+
+### Minimum release-readiness checklist
+
+- Automated acceptance suite passes for all fixtures listed above.
+- Manual verification protocol is completed and attached to release notes.
+- No unresolved contradiction between this file and `docs/PRD.md` on:
+  - endpoint names,
+  - response field names,
+  - error codes,
+  - acceptance thresholds.
+- All known open items are either resolved or tracked with owner + due date.
+
+### Explicit assumptions
+
+- Fixture datasets are versioned and immutable per test ID.
+- Confidence scoring remains deterministic for identical model/version + prompt + input.
+- Query responses are graph-grounded and do not fabricate components outside the ingested graph.
