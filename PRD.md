@@ -15,3 +15,30 @@
 | Performance (query) | `perf_query_latency` | Benchmark top 20 representative queries on populated graph. | Query latency target: `p95 <= 1200ms`, `p99 <= 2000ms`; answer contract validity `100%`. | **Pass** if latency and contract checks pass in the same run. **Fail** on any miss. | 1) Run query benchmark suite. 2) Validate each response against schema. 3) Store report and manually review the slowest 3 queries. |
 | Release gate | `mvp_acceptance_gate` | Aggregate all tests above in CI + manual spot check. | All mandatory tests green; no Sev-1/Sev-2 defects open; manual protocol checklist complete with reviewer sign-off. | **Pass** if 100% mandatory automated tests pass and manual checklist is signed by QA + PM. **Fail** if any mandatory check is red or unsigned. | 1) Review CI report. 2) Execute manual checklist items for one happy path, one error path, and one performance report. 3) Capture approver names/date in release log. |
 
+## Cross-page resolution
+
+To improve wiring-reference linking across multi-page schematics, add a dedicated cross-page resolution flow:
+
+1. **Parse reference tokens**
+   - Extract explicit page pointers (for example, `to page 3`) and connector/component reference IDs from OCR text.
+   - Normalize parsed tokens (page numbers, connector IDs, and directional phrases) into a canonical reference object.
+
+2. **Perform candidate matching heuristics**
+   - Match candidate targets using a weighted strategy:
+     - connector/component label equality,
+     - wire color equality or compatible aliases,
+     - spatial proximity to known anchor regions on the referenced page.
+   - Keep top candidates with confidence scores for later reconciliation.
+
+3. **Persist unresolved links separately**
+   - If no match exceeds confidence threshold, store the reference in an `unresolved_links` collection.
+   - Include source page, source element, parsed tokens, attempted candidates, and failure reason.
+
+4. **Run retry strategy with second-pass global matching**
+   - After first-pass page-local matching completes, execute a second-pass global resolver over all pages.
+   - Retry unresolved links using full-document context (newly discovered connectors, merged aliases, and global graph topology).
+   - Promote resolved links back into the canonical link graph; retain unresolved items otherwise.
+
+5. **Expose unresolved count in API outputs**
+   - `/upload` response should include `unresolved_reference_count` (and optionally unresolved IDs for debugging).
+   - `/metrics` should publish unresolved reference totals/gauges so operators can track reconciliation quality over time.
