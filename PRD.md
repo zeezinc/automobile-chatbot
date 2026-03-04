@@ -1,133 +1,225 @@
 # Product Requirements Document (PRD)
+## Circuit Knowledge Graph Assistant (CKGA) – MVP/POC v1.1 (Consolidated)
 
-## Guardrails & DON’Ts
-1. Do not invent components/wires absent in graph.
-2. Do not answer from model priors when graph lookup fails.
-3. Always cite component keys/pages used for answer derivation.
-4. Return `NOT_FOUND`/`INSUFFICIENT_GRAPH_DATA` for missing graph evidence.
-5. Block unsupported asks (e.g., safety-critical diagnosis claims) with safe refusal template.
-# Product Requirements Document (PRD): Confidence-Aware Knowledge Graph Querying
+## 1) Objective
+Build a fully working MVP/POC that can ingest automotive circuit diagram PDFs, extract graph entities and relationships, and support chatbot-style question answering grounded in the extracted graph.
 
-## Overview
-This update introduces confidence-aware behavior across parsing and query response flows so consumers can assess extraction quality and uncertainty.
+Core target capability:
+- Identify **components**.
+- Identify **incoming/outgoing branches (wires)** for each component.
+- Identify **relationships and power-flow paths** between components.
+- Answer questions like:
+  - "How many incoming wires are there for component A?"
+  - "Which incoming wires go into Relay R1?"
+  - "What are outgoing branches from Fuse F1?"
+  - "Find path between Fuse F1 and ECU."
 
-## Goals
-- Surface parser confidence at graph element level (nodes and edges).
-- Expose confidence insights in query responses.
-- Add guardrails for low-confidence outputs.
-- Track low-confidence rates for observability.
-- Allow clients to opt in to confidence details.
+---
 
-## Requirements
+## 2) Scope
+### In Scope (MVP)
+- Upload automotive circuit PDF(s).
+- Parse pages to structured entities/relations with LLM vision/text.
+- Build in-memory directed graph (NetworkX `DiGraph`).
+- Query graph via API and chat UI.
+- Track metrics and structured logs.
+- Add strict validation and guardrails to reduce hallucinations.
+- Apply confidence-aware querying and response formatting.
 
-### 1) Parser-stage confidence fields for nodes and edges
-- The parser **must** output a `confidence` field for every extracted node.
-- The parser **must** output a `confidence` field for every extracted edge.
-- Confidence values should be normalized floating-point values in the range `[0.0, 1.0]`.
-- Missing confidence values should be treated as `null` and counted in quality metrics.
+### Out of Scope (Phase 1)
+- Multi-user auth/roles.
+- Persistent graph DB (Neo4j production setup).
+- High-precision OCR model tuning/fine-tuning.
+- Full diagnostic/safety decision engine.
 
-### 2) Query response payload includes confidence summary and uncertainty note
-When confidence is requested (see optional parameter below), query responses should include:
-- `confidence_summary` object containing:
-  - `node_confidence_avg`
-  - `edge_confidence_avg`
-  - `overall_confidence`
-  - `low_confidence_node_ratio`
-  - `low_confidence_edge_ratio`
-- `uncertainty_note` string explaining whether results are reliable or require caution.
+---
 
-### 3) Threshold-based warnings
-- Introduce configurable threshold(s) for warnings.
-- Default threshold: `0.65`.
-- If `overall_confidence < 0.65`, set `uncertainty_note` to include: **"verify manually"**.
-- If node/edge averages are below threshold, include per-dimension warnings in `uncertainty_note`.
+## 3) Architecture
+Frontend (React Chat + Upload)
+→ FastAPI Backend
+→ Parser Agent (Vision/Text + schema-constrained extraction)
+→ Validation & Normalization Layer
+→ Graph Builder (`networkx.DiGraph`)
+→ Query Planner + Query Executor
+→ Response Formatter (evidence + confidence + warnings)
 
-### 4) Metrics for low-confidence node/edge ratio
-System metrics must be emitted for:
-- `low_confidence_node_ratio` = nodes below threshold / total nodes.
-- `low_confidence_edge_ratio` = edges below threshold / total edges.
-- Ratios should be produced per query and also aggregated over time for dashboards/alerts.
+---
 
-### 5) Optional query parameter `include_confidence=true`
-- Add optional query parameter: `include_confidence`.
-- Default behavior: `false` (response omits confidence payload extensions).
-- If `include_confidence=true`, include:
-  - `confidence_summary`
-  - `uncertainty_note`
-  - Any threshold-based warning annotations.
+## 4) Functional Requirements
 
-## Example Response (when `include_confidence=true`)
+### FR1 – Upload and Parse Circuit Diagram
+**Endpoint**: `POST /upload`
+
+**Input**:
+- Multipart PDF file upload.
+
+**Behavior**:
+1. Validate file type and size.
+2. Convert each PDF page to image (`PyMuPDF`).
+3. Send page images to parser agent.
+4. Validate and normalize parser output against strict schema.
+5. Build/update in-memory graph.
+6. Return parse summary.
+
+**Response example**:
 ```json
 {
-  "query": "Which sensors are likely failing?",
-  "results": [
-    { "entity": "O2 Sensor", "status": "degraded" }
-  ],
-  "confidence_summary": {
-    "node_confidence_avg": 0.71,
-    "edge_confidence_avg": 0.62,
-    "overall_confidence": 0.66,
-    "low_confidence_node_ratio": 0.18,
-    "low_confidence_edge_ratio": 0.41
-  },
-  "uncertainty_note": "Some relationship confidence is low; verify manually before acting."
+  "document_id": "doc_2026_01_15_001",
+  "pages_processed": 8,
+  "total_nodes": 42,
+  "total_edges": 57,
+  "battery_nodes": ["BATTERY_MAIN"],
+  "unresolved_cross_page_refs": 3,
+  "parse_time_ms": 1840
 }
 ```
 
-## Acceptance Criteria
-- Parser emits node and edge confidence values in `[0.0, 1.0]`.
-- API supports `include_confidence=true` and conditionally adds confidence fields.
-- Warning text includes "verify manually" when `overall_confidence < 0.65`.
-- Node and edge low-confidence ratios are computed and exposed in metrics.
-- Backward compatibility maintained when `include_confidence` is omitted.
-# Product Requirements Document (PRD)
+---
 
-## Query Contract
+### FR2 – Diagram Parsing Agent
+**Input**: page image + optional OCR text
 
-### 1) JSON DSL for query intent
-The assistant MUST express user query intent using a JSON-only DSL with the following baseline schema:
+**Output**: strict JSON only.
 
+#### Canonical schema (required)
 ```json
 {
-  "intent": "GET_INCOMING",
+  "page": 1,
+  "components": [
+    {
+      "component_key": "RELAY_R1__P1",
+      "label_raw": "Relay R1",
+      "label_normalized": "RELAY_R1",
+      "type": "Relay",
+      "page": "1",
+      "bbox": {
+        "x_min": 120,
+        "y_min": 340,
+        "x_max": 180,
+        "y_max": 380
+      },
+      "confidence": 0.92
+    }
+  ],
+  "connections": [
+    {
+      "from_component_key": "BATTERY_MAIN__P1",
+      "to_component_key": "FUSE_F1__P1",
+      "wire_color_raw": "Red",
+      "wire_color_normalized": "RED",
+      "direction": "outgoing",
+      "page": "1",
+      "cross_page_ref": null,
+      "confidence": 0.89
+    }
+  ]
+}
+```
+
+#### Normalization and key rules
+- `component_key` must be deterministic from `label_raw` and page hint:
+  1. Uppercase.
+  2. Replace non-alphanumeric with single `_`.
+  3. Collapse repeated `_` and trim leading/trailing `_`.
+  4. Normalize page token using same rule, prefix numeric-only page with `P`, use `UNKNOWN_PAGE` if unresolved.
+  5. Compose as `<LABEL_NORMALIZED>__<PAGE_HINT>`.
+  6. If collision remains in the same payload, append stable suffix `__N` (1-based).
+- `label_normalized`: uppercase tokenized canonical label.
+- `wire_color_normalized`: uppercase enum-like string (`RED`, `BLK`, `YEL`, etc.).
+- `direction` enum: `incoming | outgoing | bidirectional | unknown`.
+
+#### Parsing prompt constraints
+- Detect rectangular/labeled components.
+- Extract labels exactly as seen in `label_raw`.
+- Infer normalized labels and keys using deterministic rules.
+- Detect wire color and direction where visible.
+- Detect cross-page references/connectors.
+- Output JSON only (no prose).
+
+#### Model options
+- GPT-4o (recommended for multimodal stability)
+- Claude 3 Opus
+- Gemini 1.5 Pro
+
+---
+
+### FR3 – Graph Builder
+Use `NetworkX DiGraph`.
+
+#### Node attributes
+- `component_key` (primary ID)
+- `label_raw`
+- `label_normalized`
+- `type`
+- `page`
+- `bbox`
+- `confidence`
+
+#### Edge attributes
+- `from_component_key`
+- `to_component_key`
+- `wire_color_raw`
+- `wire_color_normalized`
+- `direction`
+- `page`
+- `cross_page_ref`
+- `confidence`
+
+#### Special processing
+- Identify battery nodes (`type == PowerSource` OR label contains battery token).
+- Compute flow depth from battery node(s) via DFS/BFS.
+- Track unresolved cross-page edges for second-pass resolution.
+
+---
+
+### FR4 – Query Agent
+**Endpoint**: `POST /query`
+
+**Input example**:
+```json
+{ "question": "How many and which incoming wires are there for Relay R1?" }
+```
+
+#### Query planning contract
+LLM must convert user question to DSL JSON only:
+```json
+{
+  "intent": "COUNT_AND_LIST_INCOMING",
   "component": "Relay R1"
 }
 ```
 
 Required fields:
-- `intent` (string): one of the supported backend intents.
+- `intent` (string): one supported backend intent.
 - `component` (string): raw component reference extracted from user input.
 
-Optional fields (if needed by intent-specific handlers):
+Optional fields:
 - `time_range` (object)
 - `filters` (object)
 - `metadata` (object)
 
-### 2) Component-resolution step
-Before backend execution, the system MUST resolve `component` against a canonical component registry using:
-1. Fuzzy matching against canonical names and aliases.
-2. Confidence scoring for each candidate.
-3. Confirmation flow if multiple plausible matches exceed the ambiguity threshold.
+#### Supported intents
+- `GET_INCOMING`
+- `GET_OUTGOING`
+- `COUNT_INCOMING`
+- `COUNT_OUTGOING`
+- `COUNT_AND_LIST_INCOMING`
+- `COUNT_AND_LIST_OUTGOING`
+- `TRACE_FROM_BATTERY`
+- `FIND_PATH`
 
-Resolution outcomes:
-- **Single high-confidence match**: proceed automatically.
-- **Multiple plausible matches**: return ambiguity guardrail response (see section 4).
-- **No plausible match**: follow deterministic unknown-component behavior (see section 3).
+#### Component-resolution behavior
+1. Resolve component text to canonical key (exact → normalized → fuzzy).
+2. Score candidates with deterministic confidence scoring.
+3. If multiple plausible matches exceed ambiguity threshold, return ambiguity response.
+4. If no candidate passes minimum threshold, skip data retrieval and return `UNKNOWN_COMPONENT`.
 
-### 3) Deterministic backend behavior for unknown components
-If no candidate passes the minimum confidence threshold, the backend MUST:
-1. Skip execution of data retrieval actions.
-2. Return a structured `UNKNOWN_COMPONENT` status.
-3. Include a user-safe message asking for clarification.
-4. Include up to top-3 nearest candidates (if available) with confidence scores.
+Determinism requirements:
+- Same input + same registry snapshot => same output.
+- Candidate sorting: descending confidence, then lexical name.
+- Include top-3 nearest candidates when available.
 
-This behavior MUST be deterministic:
-- Same input + same registry snapshot => same output status and candidate ordering.
-- Candidate sorting order: descending confidence, then lexical component name as tie-breaker.
-
-### 4) Guardrail response format for ambiguity
-For ambiguous component resolution, the system MUST return the following JSON shape:
-
+#### Ambiguity response format
 ```json
 {
   "status": "AMBIGUOUS_COMPONENT",
@@ -145,127 +237,290 @@ For ambiguous component resolution, the system MUST return the following JSON sh
 }
 ```
 
-Requirements:
-- Include exactly the top-3 candidates when at least 3 exist; otherwise include all available.
-- `confidence` is a normalized float in `[0.0, 1.0]`.
-- Response MUST be machine-parseable and stable in key naming.
-
-### 5) LLM output and validation requirements
-The LLM MUST output **JSON only** (no markdown, prose, or code fences).
-
-Execution pipeline requirement:
+#### LLM output and validation requirements
 1. Parse raw LLM output as JSON.
-2. Validate the JSON with Pydantic models before any backend execution.
-3. Reject invalid payloads with a structured validation error response.
+2. Validate query JSON with Pydantic models before backend execution.
+3. Reject invalid payloads with structured validation error response.
 4. Execute backend logic only on validated payloads.
 
-Validation failure response SHOULD include:
+Validation failure response should include:
 - `status: "INVALID_QUERY_PAYLOAD"`
-- `errors`: array of schema violations
+- `errors`: schema violations
 - `message`: user-safe retry prompt
-## Schema
 
-### `component_key` generation rule
+#### Query execution response requirements
+- Graph-grounded answer only.
+- Include evidence (`nodes_used`, `edges_used`, `pages_used`).
+- Include confidence payload only when `include_confidence=true`.
 
-`component_key` **must** be generated deterministically using the following normalization pipeline so the same visual label always maps to the same graph node:
+---
 
-1. Start with `label_raw`.
-2. Apply canonical normalization:
-   - convert to uppercase,
-   - replace non-alphanumeric characters with single underscores,
-   - collapse repeated underscores,
-   - trim leading/trailing underscores.
-3. Derive a `page` hint token:
-   - normalize `page` with the same uppercase alphanumeric rule,
-   - prefix with `P` if the page is numeric-only,
-   - use `UNKNOWN_PAGE` when page cannot be resolved.
-4. Compose key as: `<LABEL_NORMALIZED>__<PAGE_HINT>`.
-5. If collision remains within the same payload, append stable ordinal suffix `__N` (1-based) in detected order.
+### FR5 – Confidence-Aware Querying
+#### Parser-stage confidence
+- Parser must output `confidence` for every node and edge.
+- Confidence values are normalized floats in `[0.0, 1.0]`.
+- Missing confidence values treated as `null` and counted in quality metrics.
 
-Example: `"IGN relay #1"` on page `12` → `IGN_RELAY_1__P12`.
+#### Optional query parameter
+- `include_confidence` (default `false`).
+- If `true`, response must include:
+  - `confidence_summary`
+  - `uncertainty_note`
+  - threshold-based warnings
 
-### Component schema (required fields)
+#### Confidence summary fields
+- `node_confidence_avg`
+- `edge_confidence_avg`
+- `overall_confidence`
+- `low_confidence_node_ratio`
+- `low_confidence_edge_ratio`
 
-Every component object inserted into the graph **must include** all of the fields below:
+#### Threshold-based warnings
+- Configurable threshold; default `0.65`.
+- If `overall_confidence < 0.65`, `uncertainty_note` must include: **"verify manually"**.
+- If node/edge averages are below threshold, include per-dimension warnings.
 
-- `component_key` (string): deterministic unique key generated by the rule above.
-- `label_raw` (string): original extracted label text.
-- `label_normalized` (string): normalized label token used for matching.
-- `type` (enum): component category (see **Type enumeration**).
-- `page` (string): source page identifier where the component appears.
-- `bbox` (object): bounding box in page coordinates.
-- `confidence` (number): extraction confidence in `[0.0, 1.0]`.
+---
 
-`bbox` structure:
+### FR6 – Metrics Endpoint
+**Endpoint**: `GET /metrics`
 
-- `x_min` (number)
-- `y_min` (number)
-- `x_max` (number)
-- `y_max` (number)
+**Returns**:
+```json
+{
+  "total_nodes": 42,
+  "total_edges": 57,
+  "total_queries": 12,
+  "parse_time_ms_avg": 1840,
+  "query_latency_ms_p95": 320,
+  "unresolved_cross_page_refs": 3,
+  "low_confidence_node_ratio": 0.11,
+  "low_confidence_edge_ratio": 0.14
+}
+```
+
+System metrics must be emitted per query and aggregated over time for dashboards/alerts.
+
+---
+
+## 5) Data Schema and Validation
+
+### Component schema (required)
+- `component_key` (string)
+- `label_raw` (string)
+- `label_normalized` (string)
+- `type` (enum)
+- `page` (string)
+- `bbox` (object with `x_min`, `y_min`, `x_max`, `y_max`)
+- `confidence` (number in `[0.0, 1.0]`)
 
 Validation constraints:
-
 - `x_min < x_max`
 - `y_min < y_max`
 
-### Connection schema (required fields)
-
-Every connection object inserted into the graph **must include** all of the fields below:
-
-- `from_component_key` (string): origin component key.
-- `to_component_key` (string): destination component key.
-- `wire_color_raw` (string): original extracted wire color notation.
-- `wire_color_normalized` (string): normalized wire color token.
-- `direction` (enum): direction of current/signal flow (see **Direction enumeration**).
-- `page` (string): source page identifier where the wire segment is observed.
-- `cross_page_ref` (string|null): cross-page pointer when connection spans pages.
-- `confidence` (number): extraction confidence in `[0.0, 1.0]`.
+### Connection schema (required)
+- `from_component_key` (string)
+- `to_component_key` (string)
+- `wire_color_raw` (string)
+- `wire_color_normalized` (string)
+- `direction` (enum)
+- `page` (string)
+- `cross_page_ref` (string|null)
+- `confidence` (number in `[0.0, 1.0]`)
 
 Validation constraints:
-
-- `from_component_key != to_component_key` unless explicitly marked as loop/test connection.
-- `from_component_key` and `to_component_key` must resolve to known components in the payload.
+- `from_component_key != to_component_key` unless explicitly marked loop/test.
+- Connection endpoints must resolve to known components.
 
 ### Direction enumeration
-
-Allowed `direction` values:
-
 - `incoming`
 - `outgoing`
 - `bidirectional`
 - `unknown`
 
 ### Type enumeration
-
-Allowed `type` values (initial canonical set, extensible through versioned schema updates):
-
-- `PowerSource`
-- `Ground`
-- `Fuse`
-- `FusibleLink`
-- `Relay`
-- `Switch`
-- `Connector`
-- `Splice`
-- `Junction`
-- `ControlUnit`
-- `Sensor`
-- `Actuator`
-- `Lamp`
-- `Motor`
-- `Resistor`
-- `Diode`
-- `Capacitor`
-- `Transistor`
-- `Terminal`
-- `Bus`
-- `TestPoint`
-- `Unknown`
+- `PowerSource`, `Ground`, `Fuse`, `FusibleLink`, `Relay`, `Switch`, `Connector`, `Splice`, `Junction`, `ControlUnit`, `Sensor`, `Actuator`, `Lamp`, `Motor`, `Resistor`, `Diode`, `Capacitor`, `Transistor`, `Terminal`, `Bus`, `TestPoint`, `Unknown`
 
 ### Payload validation and repair rule
+All payloads must be validated before graph insertion.
+- Deterministic repair is allowed for recoverable issues (enum casing, key regeneration, clamping confidence, null-like coercion).
+- If required fields are missing or repair requires guesswork, reject payload (or invalid records in partial-ingest mode) and log explicit errors.
+- No invalid component or connection may be inserted.
 
-All payloads **must be validated before graph insertion**.
+---
 
-- If a record fails required-field checks, enum checks, range checks, or key-resolution checks, the ingest layer must attempt deterministic repair first (e.g., normalize enum casing, regenerate `component_key`, clamp confidence to `[0,1]` when recoverable, coerce null-like values).
-- If required fields are missing or repair cannot make the record schema-valid without guesswork, the payload (or invalid records in partial-ingest mode) must be rejected and logged with explicit validation errors.
-- No invalid component or connection may be inserted into the graph.
+## 6) Guardrails and DON’Ts
+
+### Must-do guardrails
+1. Graph-grounded answers only.
+2. Evidence required: cite component keys/pages/edges used.
+3. Ambiguity flow: never silently pick among multiple plausible components.
+4. Confidence warning on low-confidence outputs.
+5. Error taxonomy with explicit statuses: `NOT_FOUND`, `UNKNOWN_COMPONENT`, `AMBIGUOUS_COMPONENT`, `INSUFFICIENT_GRAPH_DATA`, `INVALID_QUERY_PLAN`, `INVALID_QUERY_PAYLOAD`.
+
+### DON’Ts
+1. Do not invent components/wires absent in graph.
+2. Do not answer from model priors when graph lookup fails.
+3. Do not omit citations for derivation evidence.
+4. Return `NOT_FOUND`/`INSUFFICIENT_GRAPH_DATA` when graph evidence is missing.
+5. Block unsupported safety-critical asks with safe refusal template.
+6. Don’t expose API keys, raw secrets, or sensitive logs.
+
+---
+
+## 7) Non-Functional Requirements
+- Query latency target: `< 3s`.
+- Parsing latency target: `< 5s/page`.
+- Strict JSON validation for parser and query planner output.
+- Graceful failure on invalid JSON or unresolved component.
+- Structured logs for all LLM calls (without leaking secrets).
+
+---
+
+## 8) Tech Stack
+### Backend
+- FastAPI
+- Uvicorn
+- NetworkX
+- PyMuPDF
+- Pydantic
+- Python logging / Loguru (optional)
+- OpenAI SDK
+- Prometheus (optional)
+
+### Frontend
+- React (Vite)
+- Axios
+- Tailwind CSS
+
+### LLM
+- GPT-4o for vision extraction
+- GPT-4.1 (or equivalent) for structured query planning/formatting
+
+---
+
+## 9) Suggested Repository Structure
+```text
+circuit-kg-assistant/
+├── backend/
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── config.py
+│   │   ├── models/schemas.py
+│   │   ├── agents/
+│   │   │   ├── parser_agent.py
+│   │   │   ├── graph_agent.py
+│   │   │   └── query_agent.py
+│   │   ├── services/
+│   │   │   ├── pdf_service.py
+│   │   │   └── graph_service.py
+│   │   ├── routes/
+│   │   │   ├── upload.py
+│   │   │   ├── query.py
+│   │   │   └── metrics.py
+│   │   ├── utils/
+│   │   │   ├── logger.py
+│   │   │   └── metrics.py
+│   │   └── graph/graph_store.py
+│   ├── requirements.txt
+│   └── .env
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx
+│   │   ├── components/
+│   │   │   ├── ChatBox.jsx
+│   │   │   ├── Message.jsx
+│   │   │   └── Upload.jsx
+│   │   └── api.js
+│   └── package.json
+├── docs/
+│   └── PRD.md
+├── README.md
+└── docker-compose.yml
+```
+
+---
+
+## 10) Implementation Notes
+### Parser flow
+1. PDF page → image.
+2. Image → LLM with strict schema instruction.
+3. Validate with Pydantic.
+4. Retry once on invalid JSON.
+5. Drop/flag low-confidence ambiguous edges.
+
+### Graph service API (minimum)
+- `add_component(node)`
+- `add_connection(edge)`
+- `get_incoming(component_key)`
+- `get_outgoing(component_key)`
+- `count_incoming(component_key)`
+- `count_outgoing(component_key)`
+- `trace_from_battery()`
+- `find_path(source, target)`
+
+### Query planner prompt (strict)
+> You are a circuit graph query planner. Convert the user question into one supported intent JSON. Do not answer the user directly. Output strict JSON only.
+
+---
+
+## 11) Metrics to Track
+- Components detected per page
+- Wires detected per page
+- Unresolved cross-page refs
+- Parse latency (avg/p95)
+- Query latency (avg/p95)
+- Graph depth from battery
+- Low-confidence node/edge ratio
+- Query success/failure by error code
+
+---
+
+## 12) MVP Evaluation Cases
+- “List outgoing wires from Battery.”
+- “Which wires go into Relay R1?”
+- “How many incoming wires are there for component A?”
+- “Trace power flow from Battery to Headlight.”
+- “Find path between Fuse F1 and ECU.”
+- Ambiguous case: “Show incoming wires to Relay.” → should request clarification.
+
+---
+
+## 13) POC Success Criteria
+- ≥ 75% component extraction accuracy on validation set.
+- Incoming/outgoing wire query correctness on golden fixtures.
+- Flow trace from battery works on representative diagrams.
+- Query p95 latency < 3 seconds under target load.
+- No hallucinated answers in red-team test prompts.
+
+---
+
+## 14) Risk Areas and Mitigations
+1. **LLM invalid JSON** → schema validation + retry + fallback error.
+2. **Over/under-detected wires** → confidence scoring + manual review mode.
+3. **Cross-page complexity** → second-pass resolver + unresolved ref reporting.
+4. **Label ambiguity** → deterministic normalization + clarification workflow.
+
+---
+
+## 15) Future Upgrades (Phase 2+)
+- Replace NetworkX with Neo4j.
+- Cypher generation and graph analytics.
+- Visual graph explorer UI.
+- Persistent storage and versioned graphs.
+- Fine-tuned extraction model for improved precision.
+
+---
+
+## 16) How to Use This PRD in Antigravity
+1. Create a project in Antigravity and upload this PRD.
+2. Ask Antigravity to generate epics from sections 4–7 and 11–13.
+3. Generate implementation tasks in this order:
+   - Backend skeleton + schemas
+   - `/upload` parser flow
+   - Graph service + query intents
+   - `/query` execution + guardrails
+   - Metrics/logging
+   - Frontend chat/upload
+4. Use section 13 as Definition of Done gates.
+5. Run weekly PRD drift review (implementation vs PRD contracts).
