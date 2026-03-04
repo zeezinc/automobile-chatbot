@@ -1,4 +1,3 @@
 # automobile-chatbot
 
-## Documentation
-- PRD: [`PRD.md`](./PRD.md)
+See `PRD.md` for product requirements and feature specifications.
